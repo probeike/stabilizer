@@ -1,8 +1,9 @@
-"""headlock command line: track, check, export, test-clip, circles."""
+"""headlock command line: track, check, export, test-clip, circles, captions."""
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from fractions import Fraction
 from pathlib import Path
@@ -197,6 +198,8 @@ def cmd_track(args) -> None:
     track_out = Path(args.track) if args.track else Path(base + ".track.json")
     track.save(track_out)
     print(f"Wrote {track_out}")
+    if args.no_export:
+        return
     _export(track, args, Path(args.output) if args.output else _default_output(base, track, args))
 
 
@@ -298,6 +301,72 @@ def cmd_circles(args) -> None:
           "CircleZoom's Size in the Fusion page to zoom on the face.")
 
 
+def cmd_captions(args) -> None:
+    from . import captions, resolve_api
+    from .circles import SR
+
+    if not (args.lyrics or args.timing):
+        sys.exit("error: give the lyrics (--lyrics lyrics.txt), or a timing file to place again (--timing)")
+    resolve = readstring = None
+    if not args.no_resolve and not args.audio:
+        try:
+            resolve, module = resolve_api.connect()
+            readstring = module.readstring
+            _, tl = resolve_api.current_timeline(resolve)
+            fps = resolve_api.timeline_fps(tl)
+        except resolve_api.ResolveError as e:
+            sys.exit(f"error: {e}")
+
+    if args.timing:
+        phrases = captions.read_lrc(args.timing)
+        lrc = Path(args.timing)
+    else:
+        lyrics = Path(args.lyrics).read_text()
+        phrases = captions.parse_lyrics(lyrics)
+        if not phrases:
+            sys.exit("error: the lyrics file has no lines")
+        if args.audio:
+            audio, lrc = _read_audio_or_exit(args.audio), Path(args.audio).with_suffix(".lrc")
+        else:
+            pieces = resolve_api.audio_pieces(tl, args.track)
+            print(f"Listening to audio track {args.track} of \"{tl.GetName()}\" ({len(pieces)} clip(s))…")
+            audio = resolve_api.timeline_audio(pieces)
+            lrc = Path(pieces[0].path).with_name(re.sub(r"[^\w.-]+", "_", tl.GetName()) + ".lrc")
+        print(f"Listening for the words (Whisper {args.model}; the first run downloads it)…")
+        heard = captions.clean_heard(captions.transcribe(audio, lyrics, args.model, args.language), audio, SR)
+        for note in captions.align(phrases, heard):
+            print(f"warning: {note}", file=sys.stderr)
+        captions.show_times(phrases)
+        if args.lrc:
+            lrc = Path(args.lrc)
+        captions.write_lrc(phrases, lrc)
+        print(f"Wrote the timing to {lrc} (edit it and place again with --timing to fix a word)")
+    found = [p for p in phrases if p.found]
+    print(f"{len(found)} of {len(phrases)} lines timed")
+    if resolve is None:
+        return
+
+    family = captions.find_font(args.font)
+    if family is None:
+        print(f"warning: no installed font called \"{args.font}\"; Resolve will use a stand-in", file=sys.stderr)
+        family = (args.font, "Regular")
+    style = captions.Style(font=family[0], font_style=family[1], size=args.size, y=args.y)
+    name, problems = resolve_api.place_captions(resolve, captions.placements(phrases, style, fps), readstring)
+    for problem in problems:
+        print(f"warning: {problem}", file=sys.stderr)
+    print(f"Placed {len(found)} caption lines on the {resolve_api.CAPTION_TRACK} track of \"{name}\" in "
+          f"{family[0]}. Each line is a title: trim or move it on the timeline, or fix its words in the Fusion "
+          "page (CaptionBase and CaptionLit hold the same text).")
+
+
+def _read_audio_or_exit(path: str):
+    from .circles import read_audio
+    audio = read_audio(path)
+    if audio is None:
+        sys.exit(f"error: {path} has no audio")
+    return audio
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="headlock",
                                      description="Head-lock stabilization for DaVinci Resolve and Premiere Pro")
@@ -316,6 +385,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--model", default="rtmpose-halpe26-384", choices=["rtmpose-halpe26-384", "rtmpose-halpe26-256"])
     p.add_argument("--device", default="cpu", choices=["cpu", "coreml", "cuda"])
     p.add_argument("--preview", help="Also render a stabilized preview .mp4 with tracking overlays")
+    p.add_argument("--no-export", action="store_true",
+                   help="Only track (write the track.json); export later with 'headlock export'")
     p.add_argument("-v", "--verbose", action="store_true")
     _add_target_arg(p)
     _add_layout_args(p)
@@ -359,6 +430,22 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--model", default="rtmpose-halpe26-384", choices=["rtmpose-halpe26-384", "rtmpose-halpe26-256"])
     p.add_argument("--device", default="cpu", choices=["cpu", "coreml", "cuda"])
     p.set_defaults(func=cmd_circles)
+
+    p = sub.add_parser("captions", help="Karaoke captions of the lyrics on the current Resolve timeline")
+    p.add_argument("--lyrics", help="The lyrics, one caption line per line (blank lines and [Chorus] are skipped)")
+    p.add_argument("--timing", help="Place again from a timing file (.lrc) written earlier, e.g. after fixing it")
+    p.add_argument("--track", type=int, default=1, help="Audio track with the lead vocal (default 1)")
+    p.add_argument("--audio", help="Listen to this file instead of the timeline; only writes the timing file")
+    p.add_argument("--lrc", help="Where to write the timing file (default next to the audio)")
+    p.add_argument("--no-resolve", action="store_true", help="Don't place anything in Resolve")
+    p.add_argument("--font", default="IM Fell English", help="Font (default IM Fell English)")
+    p.add_argument("--size", type=float, default=0.07, help="Text size, as Text+'s Size (default 0.07)")
+    p.add_argument("--y", type=float, default=0.13,
+                   help="Height of the captions' centre, fraction from the top (default 0.13)")
+    p.add_argument("--model", default="large-v3-turbo",
+                   help="Whisper model (default large-v3-turbo; small.en or medium.en are lighter)")
+    p.add_argument("--language", default=None, help="Language code, e.g. en (default: detect)")
+    p.set_defaults(func=cmd_captions)
 
     args = parser.parse_args(argv)
     args.func(args)

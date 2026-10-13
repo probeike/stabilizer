@@ -11,7 +11,7 @@ smooths it lightly with a zero-phase filter, and then:
 
 It also builds **chorus circles** in DaVinci Resolve: three extra clips of you singing the chorus,
 each in a soft-edged circle along the bottom of the main vertical video, lined up with each other
-by their audio.
+by their audio. And it adds **karaoke captions** of your lyrics, each word lighting up as it's sung.
 
 ## Setup
 
@@ -26,11 +26,16 @@ run and are cached.
 Double-click **`Headlock.command`** in Finder (or run `uv run headlock-ui`). It has three tabs:
 
 - **Head-lock**: choose a video; the app spots 360 footage (2:1 frames) and portrait clips and sets
-  sensible defaults. Press **Track & export**. Once a video has been tracked, **Re-export** reuses the
-  tracking, so changing the framing only takes the export/render time.
+  sensible defaults. Press **Track**. When it finishes, the **framing preview** opens: it plays the
+  clip as it will come out while you change the field of view, head height, smoothing or output
+  frame (space plays/pauses, arrows step a frame, *Show tracking marks* draws the lock point and the
+  raw tracking). Like Insta360 Studio's preview it redraws every frame through the virtual camera as
+  it plays, only smaller and silent. Press **Export** when it looks right; the tracking is kept, so
+  you can preview and export again without re-tracking.
 - **Chorus circles**: choose the main video and the left, middle and right chorus clips, then
   **Build in Resolve** (see below). **Add Headlock to Resolve's Scripts menu** puts a *Headlock* item
   under Workspace > Scripts in Resolve that opens this window.
+- **Captions**: paste the lyrics and caption the timeline open in Resolve (see below).
 - **Check & test**: the fit check for a tracked clip, and the synthetic test clips used to validate
   the Resolve/Premiere output.
 
@@ -123,6 +128,34 @@ outside), with Preferences → System → General → **External scripting using
 open. `--no-resolve` skips Resolve and only writes the `.circle.setting` files and prints the sync;
 by hand, put each clip on its own track, open it in the Fusion page, drag its `.circle.setting` into
 the Node Editor, connect `MediaIn1` to `CircleFace` if it isn't already, and `CirclePlace` to `MediaOut1`.
+
+## Karaoke captions (DaVinci Resolve)
+
+The lyrics a line at a time in the band above your head, in IM Fell English: the whole line is
+shown dimmed, and each word lights up as you sing it and stays lit.
+
+1. Align your clips, with the lead vocal on audio track 1, and keep that timeline open in Resolve.
+2. Once per project: in the Edit page's Effects library, drag **Titles → Text+** into the Media Pool.
+3. In the app's **Captions** tab, paste the lyrics (one caption per line, as you'd like it shown;
+   blank lines and `[Chorus]`-style headings are skipped) and press **Caption the current timeline**.
+   Or: `uv run headlock captions --lyrics lyrics.txt`.
+
+No timing needed: it listens to audio track 1 through your edit with Whisper (`large-v3-turbo`,
+downloaded on first use, about 1.6 GB), which gets the lyrics as hints, and then lines what it heard
+up with your lyrics. So the words shown are always yours, even where it misheard one ("seeing" for
+"sing"). Words it didn't catch are spread between their neighbours. Lines it can't find in the
+recording are left out and listed. Each line becomes a title on a video track called **Captions**,
+and captioning again replaces them.
+
+The timing is also saved as `<timeline>.lrc` next to the main video, one line per caption:
+`[00:12.30]<00:12.55>I <00:12.80>keep <00:13.10>running <00:13.90>`. To fix a word, change its time
+there and press **Place again from a timing file** (`--timing song.lrc`), which doesn't listen again.
+To restyle without listening again, use the same button. Options: `--font`, `--size` (Text+ Size,
+default 0.07; lines over 24 characters go on two rows), `--y` (centre height from the top, default
+0.13; the head sits at 0.35 in 360 head-locks), `--track` (vocal track), `--model`, `--language`.
+
+In Fusion each title holds `CaptionBase` (the dimmed line) under `CaptionLit` (the same line, lit),
+whose Write On end steps forward as each word starts.
 
 ## Framing options (`track` and `export`)
 | Flag | Default | Meaning |

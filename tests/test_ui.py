@@ -1,4 +1,6 @@
 import io
+import shutil
+import time
 
 import pytest
 from tqdm import tqdm
@@ -9,14 +11,15 @@ tk = pytest.importorskip("tkinter")
 
 
 @pytest.fixture
-def app():
+def app(monkeypatch, tmp_path):
     try:
         root = tk.Tk()
     except tk.TclError:
         pytest.skip("no display for Tk")
     root.withdraw()
-    from headlock.ui import App
-    yield App(root)
+    from headlock import ui
+    monkeypatch.setattr(ui, "LYRICS_FILE", tmp_path / "lyrics.txt")
+    yield ui.App(root)
     root.destroy()
 
 
@@ -100,3 +103,46 @@ def test_buttons_follow_what_is_chosen(app, tmp_path):
     app.chorus["middle"].set(str(tmp_path / "b.mov"))
     app._refresh_buttons()
     assert app.build_btn.instate(["!disabled"]) and app.files_btn.instate(["!disabled"])
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg/ffprobe")
+def test_preview_window_plays_and_follows_the_options(app, tmp_path):
+    from headlock import cli
+
+    clip = tmp_path / "dot360.mp4"
+    cli.main(["test-clip", str(clip), "--360", "--size", "1024x512", "--fps", "10", "--seconds", "2"])
+    app.video.set(str(clip))
+    app._open_preview()
+    win = app.preview_win
+
+    def pump_until(pred, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while not pred() and time.monotonic() < deadline:
+            app.root.update()
+            time.sleep(0.01)
+        assert pred()
+
+    pump_until(lambda: win.shown == 0)
+    assert (win.photo.width(), win.photo.height()) == (360, 640)
+    app.frame.set("Horizontal 1920 x 1080")                 # the preview follows the tab's options
+    pump_until(lambda: win.photo.width() == 640)
+    win.slider.set(12)                                      # scrubbing seeks
+    pump_until(lambda: win.shown == 12)
+    win._toggle()
+    pump_until(lambda: win.shown == 19)                     # plays to the end
+    app.fov.set("12x")                                      # mid-edit garbage keeps the last framing
+    win.close()
+    assert app.preview_win is None and not win.playback._thread.is_alive()
+
+
+def test_captions_args_keep_the_lyrics_for_next_time(app, tmp_path):
+    app.lyrics.insert("1.0", "[Chorus]\nSing it with me\n")
+    app.caption_font.set("IM Fell English")
+    app.caption_y.set(0.15)
+    argv = app._captions_argv()
+    assert argv[:3] == ["captions", "--lyrics", str(tmp_path / "lyrics.txt")]
+    assert (tmp_path / "lyrics.txt").read_text() == "[Chorus]\nSing it with me\n"
+    assert argv[argv.index("--font") + 1] == "IM Fell English" and argv[argv.index("--y") + 1] == "0.15"
+    from headlock import ui
+    again = ui.App(app.root)                                    # a new window starts with them
+    assert again.lyrics.get("1.0", "end").strip() == "[Chorus]\nSing it with me"

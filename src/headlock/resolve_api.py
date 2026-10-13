@@ -14,10 +14,13 @@ step checks what it can and says what to do by hand when something didn't take.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
+
+import numpy as np
 
 from . import circles
 
@@ -212,6 +215,149 @@ def build(resolve, job: Job, readstring) -> str:
         warn("couldn't link the circles; select them all and press Cmd+Alt+L to link them")
     resolve.OpenPage("edit")
     return name
+
+
+# ---- captions --------------------------------------------------------------------------------
+
+CAPTION_TRACK = "Captions"
+CAPTION_TEMPLATES = ("Headlock Caption", "Text+")
+NEEDS_TEMPLATE = ("Put a Text+ title in the Media Pool first (once per project): in the Edit page's Effects "
+                  "library, open Titles and drag Text+ into the Media Pool.")
+
+
+@dataclass(frozen=True)
+class AudioPiece:
+    path: str
+    source_start: float     # s into the file
+    duration: float         # s
+    at: float               # s from the timeline's start
+
+
+def current_timeline(resolve):
+    project = resolve.GetProjectManager().GetCurrentProject()
+    tl = project.GetCurrentTimeline() if project else None
+    if not tl:
+        raise ResolveError("No timeline is open in Resolve. Open the one to caption and try again.")
+    return project, tl
+
+
+def timeline_fps(tl) -> float:
+    m = re.match(r"\s*([\d.]+)", str(tl.GetSetting("timelineFrameRate")))
+    if not m:
+        raise ResolveError("Couldn't read the timeline's frame rate")
+    return float(m[1])
+
+
+def audio_pieces(tl, track: int = 1) -> list[AudioPiece]:
+    """The clips on audio track ``track``: which file, which part of it, and where on the timeline.
+
+    The part of the file comes from the clip's left offset (how far it could be extended at the
+    head, i.e. where it starts in its media), in timeline frames.
+    """
+    fps, t0 = timeline_fps(tl), tl.GetStartFrame()
+    pieces = []
+    for item in tl.GetItemListInTrack("audio", track) or []:
+        clip = item.GetMediaPoolItem()
+        path = clip.GetClipProperty("File Path") if clip else None
+        if path:
+            pieces.append(AudioPiece(path, item.GetLeftOffset() / fps, item.GetDuration() / fps,
+                                     (item.GetStart() - t0) / fps))
+    if not pieces:
+        raise ResolveError(f"Audio track {track} of the timeline has no clips to listen to")
+    return pieces
+
+
+def timeline_audio(pieces: list[AudioPiece], sr: int = circles.SR) -> np.ndarray:
+    """The track's sound as one waveform from the timeline's start, silent between clips."""
+    out = np.zeros(int(max(p.at + p.duration for p in pieces) * sr) + 1, np.float32)
+    for p in pieces:
+        a = circles.read_audio(p.path, sr, p.source_start, p.duration)
+        if a is None:
+            continue
+        i = int(round(p.at * sr))
+        a = a[:len(out) - i]
+        out[i:i + len(a)] += a
+    return out
+
+
+def _find_template(pool):
+    clips = {}
+    for clip in _all_clips(pool.GetRootFolder()):
+        clips.setdefault(clip.GetName(), clip)
+    for name in CAPTION_TEMPLATES:
+        if name in clips:
+            return clips[name]
+    raise ResolveError(NEEDS_TEMPLATE)
+
+
+def _caption_track(tl) -> int:
+    """The video track named Captions, emptied; or a new one on top."""
+    for i in range(1, tl.GetTrackCount("video") + 1):
+        if tl.GetTrackName("video", i) == CAPTION_TRACK:
+            old = tl.GetItemListInTrack("video", i) or []
+            if old:
+                tl.DeleteClips(old)
+            return i
+    tl.AddTrack("video")
+    i = tl.GetTrackCount("video")
+    tl.SetTrackName("video", i, CAPTION_TRACK)
+    return i
+
+
+def _wire_caption(item, setting: str, readstring) -> str | None:
+    """Swap the title's Text+ for the caption nodes. Returns a problem, or None."""
+    comp = item.GetFusionCompByIndex(1) if item.GetFusionCompCount() else None
+    table = readstring(setting) if comp else None
+    if not table:
+        return "couldn't open the title's Fusion comp"
+    for tool in (comp.GetToolList(False, "TextPlus") or {}).values():
+        tool.Delete()
+    comp.Paste(table)
+    merge, out = comp.FindTool("CaptionMerge"), comp.FindTool("MediaOut1")
+    if not (merge and out):
+        return "the caption nodes didn't paste"
+    out.ConnectInput("Input", merge)
+    if comp.FindTool("CaptionLit").GetInput("End") is None:
+        return ("Text+ has no input called End, so the words can't light up; tell Claude which input "
+                "Text+'s Write On uses")
+    return None
+
+
+def place_captions(resolve, placements: list, readstring) -> tuple[str, list[str]]:
+    """One title per lyric line on the Captions track. Returns the timeline's name and any problems.
+
+    Whether AppendToTimeline's endFrame is inclusive isn't documented, so the first title is
+    placed, measured and, if one frame long, replaced; the rest follow the same rule.
+    """
+    project, tl = current_timeline(resolve)
+    template = _find_template(project.GetMediaPool())
+    pool = project.GetMediaPool()
+    track = _caption_track(tl)
+    start = tl.GetStartFrame()
+    inclusive = None
+    problems: list[str] = []
+    for p in placements:
+        def put(end):
+            got = pool.AppendToTimeline([{"mediaPoolItem": template, "startFrame": 0, "endFrame": end,
+                                          "trackIndex": track, "recordFrame": start + p.start}]) or []
+            return got[0] if got and got[0] else None
+        if inclusive is None:
+            item = put(p.frames)
+            if item and item.GetDuration() == p.frames + 1:
+                tl.DeleteClips([item])
+                inclusive, item = True, put(p.frames - 1)
+            else:
+                inclusive = False
+        else:
+            item = put(p.frames - 1 if inclusive else p.frames)
+        if not item:
+            problems.append(f"couldn't place the line \"{p.phrase.text(10**6)}\"")
+            continue
+        problem = _wire_caption(item, p.setting, readstring)
+        if problem and problem not in problems:
+            problems.append(problem)
+    resolve.OpenPage("edit")
+    return tl.GetName(), problems
 
 
 MENU_SCRIPT = '''"""Opens the Headlock window. Added by Headlock's "Add Headlock to Resolve's Scripts menu" button."""

@@ -156,3 +156,52 @@ def test_circles_end_to_end(tmp_path, monkeypatch, capsys):
     comp = next(i for i in tl.items if i.clip.path.endswith("take_left.mov") and i.media_type == 1).comps[0]
     face = comp.tools["CircleFace"].inputs["Center"]
     assert (face[1], face[2]) == pytest.approx((1 - 0.6, 1 - (1 - 0.4)), abs=0.01)   # head moved to the middle
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg/ffprobe")
+def test_captions_end_to_end(tmp_path, monkeypatch, capsys):
+    """Lyrics + the timeline's vocal -> timing file + caption titles (Whisper stood in for)."""
+    from types import SimpleNamespace
+
+    from fake_resolve import FakeClip
+    from scipy.io import wavfile
+    from test_resolve_api import _caption_project
+
+    from headlock import captions, resolve_api
+
+    sr = 16000
+    vocal = np.zeros(20 * sr, np.float32)
+    for t in (2.2, 2.6, 3.0, 12.2, 12.6):                       # five sung words, file time
+        vocal[int(t * sr):int((t + 0.3) * sr)] = 0.3
+    wavfile.write(tmp_path / "song.wav", sr, vocal)
+    resolve, tl = _caption_project()
+    for item in tl.items:
+        item.clip.path = str(tmp_path / "song.wav")
+    resolve.project.pool.root.clips.append(FakeClip("Text+", 10**6, title=True))
+    monkeypatch.setattr(resolve_api, "connect", lambda: (resolve, SimpleNamespace(readstring=__import__(
+        "fake_resolve").readstring)))
+    heard_audio = {}
+
+    def fake_transcribe(audio, lyrics, model, language):
+        heard_audio["audio"] = audio
+        # The cut puts file 1-5 s at timeline 2-6 s and file 12-14 s at timeline 8-10 s.
+        return [captions.Heard(w, t, t + 0.3) for w, t in
+                (("I", 3.2), ("keep", 3.6), ("running", 4.0), ("sing", 8.2), ("loud", 8.6))]
+    monkeypatch.setattr(captions, "transcribe", fake_transcribe)
+
+    lyrics = tmp_path / "lyrics.txt"
+    lyrics.write_text("[Verse]\nI keep running\n\nSing it loud\n")
+    cli.main(["captions", "--lyrics", str(lyrics)])
+    out = capsys.readouterr().out
+    assert "2 of 2 lines timed" in out and "Placed 2 caption lines" in out
+    assert len(heard_audio["audio"]) == pytest.approx(10 * sr, abs=2)
+    lrc = tmp_path / "song_circles.lrc"
+    assert "<00:03.20>I <00:03.60>keep <00:04.00>running" in lrc.read_text()
+    titles = tl.GetItemListInTrack("video", 5)
+    assert [t.record - 86400 for t in titles] == [round(2.95 * 25), round(7.95 * 25)]
+
+    # Fix a word's time by hand and place again without listening.
+    lrc.write_text(lrc.read_text().replace("<00:08.60>loud", "<00:09.00>loud"))
+    monkeypatch.setattr(captions, "transcribe", lambda *a: pytest.fail("shouldn't listen again"))
+    cli.main(["captions", "--timing", str(lrc)])
+    assert len(tl.GetItemListInTrack("video", 5)) == 2

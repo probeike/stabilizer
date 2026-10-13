@@ -88,3 +88,81 @@ def test_menu_script_opens_the_app(tmp_path):
     compile(text, str(path), "exec")
     with pytest.raises(resolve_api.ResolveError):
         resolve_api.install_menu_script(tmp_path / "Headlock.command", tmp_path / "nope" / "Utility")
+
+
+# ---- captions --------------------------------------------------------------------------------
+
+def _caption_project(inclusive_end=True):
+    from fake_resolve import FakeClip, FakeItem, FakeTimeline
+
+    resolve = FakeResolve(inclusive_end=inclusive_end)
+    tl = FakeTimeline("song circles")
+    tl.settings["timelineFrameRate"] = "25"
+    tl.tracks = {"video": 4, "audio": 4}
+    vocal = FakeClip("/v/song.wav", 10**6)
+    tl.items += [FakeItem(vocal, 1, 86400 + 50, 2, duration=100, left_offset=25),     # 1 s of song from 2 s in
+                 FakeItem(vocal, 1, 86400 + 200, 2, duration=50, left_offset=300),
+                 FakeItem(FakeClip("/v/chorus.mov", 10**6), 2, 86400, 2, duration=500)]
+    resolve.project.timelines.append(tl)
+    resolve.project.current = tl
+    return resolve, tl
+
+
+def test_audio_pieces_follow_the_edit():
+    _, tl = _caption_project()
+    pieces = resolve_api.audio_pieces(tl, 1)
+    assert pieces == [resolve_api.AudioPiece("/v/song.wav", 1.0, 4.0, 2.0),
+                      resolve_api.AudioPiece("/v/song.wav", 12.0, 2.0, 8.0)]
+    with pytest.raises(resolve_api.ResolveError, match="track 3"):
+        resolve_api.audio_pieces(tl, 3)
+
+
+def test_timeline_audio_lays_the_pieces_out(tmp_path):
+    shutil = pytest.importorskip("shutil")
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("needs ffmpeg")
+    import numpy as np
+    from scipy.io import wavfile
+
+    sr = 16000
+    ramp = (np.arange(10 * sr) / (10 * sr)).astype(np.float32)        # value = position in the file / 10 s
+    wavfile.write(tmp_path / "ramp.wav", sr, ramp)
+    pieces = [resolve_api.AudioPiece(str(tmp_path / "ramp.wav"), 2.0, 1.0, 0.5),
+              resolve_api.AudioPiece(str(tmp_path / "ramp.wav"), 7.0, 0.5, 3.0)]
+    out = resolve_api.timeline_audio(pieces, sr)
+    assert len(out) == pytest.approx(3.5 * sr, abs=2)
+    assert out[int(0.25 * sr)] == 0 and out[int(2.0 * sr)] == 0                   # gaps are silent
+    assert out[int(1.0 * sr)] == pytest.approx(0.25, abs=1e-3)                    # 0.5 s into a cut from 2 s
+    assert out[int(3.25 * sr)] == pytest.approx(0.725, abs=1e-3)
+
+
+def _placements(n=3):
+    from headlock import captions
+    phrases = [captions.Phrase([captions.Word(f"line{k}", 1.0 + 2 * k, 1.5 + 2 * k, True)]) for k in range(n)]
+    captions.show_times(phrases)
+    return captions.placements(phrases, captions.Style(), 25)
+
+
+@pytest.mark.parametrize("inclusive_end", [True, False])
+def test_captions_go_on_their_own_track_as_lit_titles(inclusive_end):
+    from fake_resolve import FakeClip
+
+    resolve, tl = _caption_project(inclusive_end)
+    with pytest.raises(resolve_api.ResolveError, match="Text\\+"):
+        resolve_api.place_captions(resolve, _placements(), readstring)
+    resolve.project.pool.root.clips.append(FakeClip("Text+", 10**6, title=True))
+
+    placements = _placements()
+    name, problems = resolve_api.place_captions(resolve, placements, readstring)
+    assert name == "song circles" and problems == []
+    assert tl.tracks["video"] == 5 and tl.GetTrackName("video", 5) == "Captions"
+    titles = tl.GetItemListInTrack("video", 5)
+    assert [(t.record - 86400, t.duration) for t in titles] == [(p.start, p.frames) for p in placements]
+    comp = titles[0].comps[0]
+    assert "Template" not in comp.tools                                     # the stock Text+ is replaced
+    assert comp.tools["MediaOut1"].connected["Input"] == "CaptionMerge"
+    assert comp.tools["CaptionLit"].inputs["StyledText"] == "line0"
+
+    # Captioning again replaces the old lines instead of stacking another track.
+    resolve_api.place_captions(resolve, _placements(2), readstring)
+    assert tl.tracks["video"] == 5 and len(tl.GetItemListInTrack("video", 5)) == 2

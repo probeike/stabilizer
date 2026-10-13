@@ -31,3 +31,14 @@ def test_phone_rotation_flag_reports_the_upright_size(tmp_path):
     info = probe(phone)
     assert (info.width, info.height) == (32, 64)
     assert next(iter_frames(phone, max_height=None)).shape == (64, 32, 3)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg/ffprobe")
+@pytest.mark.parametrize("start", [1, 7, 29])
+def test_iter_frames_starts_at_the_given_frame(tmp_path, start):
+    path = tmp_path / "ramp.mp4"
+    with VideoWriter(path, 64, 48, Fraction(30000, 1001)) as w:
+        for i in range(30):
+            w.write(np.full((48, 64, 3), 8 * i, np.uint8))
+    levels = [float(f.mean()) / 8 for f in iter_frames(path, max_height=None, start=start, fast=True)]
+    np.testing.assert_allclose(levels, range(start, 30), atol=0.5)   # H.264 shifts flat greys a little

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -63,21 +64,29 @@ def probe(path: str | Path) -> VideoInfo:
 
 
 def iter_frames(path: str | Path, max_height: int | None = 1080, depth: int = 8,
-                step: int = 1) -> Iterator[np.ndarray]:
+                step: int = 1, start: int = 0, fast: bool = False) -> Iterator[np.ndarray]:
     """Yield BGR frames, downscaled so height <= max_height (aspect preserved).
 
     depth 8 -> uint8 frames; depth 16 -> uint16, which keeps 10-bit (e.g. log) sources intact.
     step > 1 yields only every step-th frame (0, step, 2*step, ...), dropped before scaling.
+    start: first frame to yield (seeks rather than decoding everything before it).
+    fast: for live preview: hardware decoding on macOS and a cheaper downscale.
     """
     info = probe(path)
     w, h = info.width, info.height
     if max_height and h > max_height:
         w = round(w * max_height / h / 2) * 2
         h = max_height
-    cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0"]
+    cmd = ["ffmpeg", "-v", "error"]
+    if fast and sys.platform == "darwin":
+        cmd += ["-hwaccel", "videotoolbox"]
+    if start > 0:
+        # Half a frame early: ffmpeg keeps the first frame at or after this time, which is frame ``start``.
+        cmd += ["-ss", f"{(start - 0.5) / float(info.fps):.6f}"]
+    cmd += ["-i", str(path), "-map", "0:v:0"]
     filters = [f"select=not(mod(n\\,{step}))"] if step > 1 else []
     if (w, h) != (info.width, info.height):
-        filters.append(f"scale={w}:{h}:flags=area")
+        filters.append(f"scale={w}:{h}:flags={'bilinear' if fast else 'area'}")
     if filters:
         cmd += ["-vf", ",".join(filters)]
     if step > 1:
@@ -93,8 +102,8 @@ def iter_frames(path: str | Path, max_height: int | None = 1080, depth: int = 8,
                 break
             yield np.frombuffer(buf, dtype).reshape(h, w, 3)
     finally:
+        proc.kill()           # before closing the pipe, so stopping early (a seek) isn't reported as an error
         proc.stdout.close()
-        proc.kill()
         proc.wait()
 
 

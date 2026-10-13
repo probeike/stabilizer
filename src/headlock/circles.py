@@ -142,9 +142,12 @@ def find_framing(path: str | Path, diameter: float, estimator, samples: int = SA
 
 # ---- audio sync ------------------------------------------------------------------------------
 
-def read_audio(path: str | Path, sr: int = SR) -> np.ndarray | None:
-    """First audio stream as mono float32 at ``sr``; None if the file has no audio."""
-    proc = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0", "-ac", "1",
+def read_audio(path: str | Path, sr: int = SR, start: float = 0.0,
+               duration: float | None = None) -> np.ndarray | None:
+    """First audio stream as mono float32 at ``sr`` (optionally ``duration`` s from ``start`` s);
+    None if the file has no audio."""
+    span = (["-ss", f"{start:.6f}"] if start > 0 else []) + (["-t", f"{duration:.6f}"] if duration else [])
+    proc = subprocess.run(["ffmpeg", "-v", "error", *span, "-i", str(path), "-map", "0:a:0", "-ac", "1",
                            "-ar", str(sr), "-f", "f32le", "-"], capture_output=True)
     if proc.returncode != 0 or not proc.stdout:
         return None
