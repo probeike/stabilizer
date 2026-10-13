@@ -1,4 +1,6 @@
+import re
 import shutil
+import subprocess
 from argparse import Namespace
 from fractions import Fraction
 
@@ -84,3 +86,73 @@ def test_360_render_end_to_end(tmp_path):
         np.testing.assert_allclose([x0 + (w * xs).sum() / w.sum(), y0 + (w * ys).sum() / w.sum()], L, atol=2.0)
         n += 1
     assert n == 20
+
+
+def _clip(path, size, fps, seconds, wav=None):
+    cmd = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"color=c=gray:s={size}:r={fps}:d={seconds}"]
+    cmd += ["-i", str(wav), "-shortest", "-c:a", "pcm_s16le"] if wav else []
+    subprocess.run(cmd + ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)], check=True)
+
+
+class _FakePose:
+    """Every frame: a head at (60%, 40%) of the picture, neck to head-top a tenth of its height."""
+
+    def __init__(self, *args):
+        self.boxes = None
+
+    def __call__(self, frame):
+        from headlock.head import HEAD_TOP, NECK
+        h, w = frame.shape[:2]
+        k, s = np.zeros((26, 2)), np.zeros(26)
+        k[NECK], k[HEAD_TOP] = [0.6 * w, (0.4 + 0.1 * 2 / 3) * h], [0.6 * w, (0.4 - 0.1 / 3) * h]
+        s[[NECK, HEAD_TOP]] = 0.9
+        return k, s
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg/ffprobe")
+def test_circles_end_to_end(tmp_path, monkeypatch, capsys):
+    """Three takes of one rhythm, started at different points: synced, framed, and built in (fake) Resolve."""
+    from types import SimpleNamespace
+
+    from fake_resolve import FakeResolve, readstring
+    from scipy.io import wavfile
+    from test_circles import _take
+
+    from headlock import circles, pose, resolve_api
+
+    rng = np.random.default_rng(5)
+    onsets = np.cumsum(rng.uniform(0.15, 0.6, 40))
+    starts = {"left": 1.0, "middle": 0.0, "right": 2.5}       # song time each take started recording
+    clips = {}
+    for name, start in starts.items():
+        wav = tmp_path / f"{name}.wav"
+        wavfile.write(wav, circles.SR, _take(onsets, 8, start, 220, 0.5, rng, jitter=0.03))
+        clips[name] = tmp_path / f"take_{name}.mov"
+        _clip(clips[name], "180x320", 30, 8, wav)
+    main = tmp_path / "song.mp4"
+    _clip(main, "216x384", "30000/1001", 10)
+    monkeypatch.setattr(pose, "PoseEstimator", _FakePose)
+    argv = ["circles", str(main), *(a for n, p in clips.items() for a in (f"--{n}", str(p)))]
+
+    cli.main(argv + ["--no-resolve"])
+    out = capsys.readouterr().out
+    for name, start in starts.items():
+        said = re.search(rf"{name}: take_{name}.mov starts ([0-9.]+)s", out)
+        assert float(said[1]) == pytest.approx(start, abs=1 / 30)
+        text = (tmp_path / f"take_{name}.{name}.circle.setting").read_text()
+        assert "CirclePlace = Merge" in text
+
+    resolve = FakeResolve()
+    monkeypatch.setattr(resolve_api, "connect", lambda: (resolve, SimpleNamespace(readstring=readstring)))
+    cli.main(argv + ["--at", "0:02"])
+    assert 'Built the timeline "song circles"' in capsys.readouterr().out
+    tl = resolve.project.current
+    assert tl.settings["timelineResolutionWidth"] == "216" and tl.settings["timelineFrameRate"] == "29.97"
+    records = {(i.clip.path.rsplit("/", 1)[-1], i.media_type): i.record - 86400 for i in tl.items}
+    for name, start in starts.items():
+        want = round((2 + start) * 30000 / 1001)
+        assert abs(records[(f"take_{name}.mov", 1)] - want) <= 1
+        assert records[(f"take_{name}.mov", 2)] == records[(f"take_{name}.mov", 1)]
+    comp = next(i for i in tl.items if i.clip.path.endswith("take_left.mov") and i.media_type == 1).comps[0]
+    face = comp.tools["CircleFace"].inputs["Center"]
+    assert (face[1], face[2]) == pytest.approx((1 - 0.6, 1 - (1 - 0.4)), abs=0.01)   # head moved to the middle

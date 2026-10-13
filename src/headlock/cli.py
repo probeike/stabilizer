@@ -1,4 +1,4 @@
-"""headlock command line: track, check, export, test-clip."""
+"""headlock command line: track, check, export, test-clip, circles."""
 
 from __future__ import annotations
 
@@ -19,6 +19,14 @@ TARGETS = {"resolve": ".headlock.setting", "premiere": ".headlock.xml"}
 def _size(text: str) -> tuple[int, int]:
     w, h = text.lower().split("x")
     return int(w), int(h)
+
+
+def _seconds(text: str) -> float:
+    """Seconds from "83.4", "1:23.4" or "0:01:23.4"."""
+    total = 0.0
+    for part in text.strip().split(":"):
+        total = total * 60 + float(part)
+    return total
 
 
 def _add_layout_args(p: argparse.ArgumentParser) -> None:
@@ -230,6 +238,66 @@ def cmd_test_clip(args) -> None:
         print(f"Next: headlock export {track_out}  -> load it in Resolve/Premiere; the dot should stay still")
 
 
+def cmd_circles(args) -> None:
+    from . import circles, resolve_api
+    from .pose import PoseEstimator
+    from .video import probe
+
+    given = [(name, getattr(args, name)) for name in circles.NAMES if getattr(args, name)]
+    if not given:
+        sys.exit("error: give at least one chorus clip: --left, --middle and/or --right")
+    main_info = probe(args.main)
+    canvas = (main_info.width, main_info.height)
+    if canvas[0] > canvas[1]:
+        print(f"warning: the main video is landscape ({canvas[0]}x{canvas[1]}); circles go along its bottom anyway",
+              file=sys.stderr)
+    slots = {s.name: s for s in circles.slots(canvas, args.diameter, args.y, args.soft)}
+    infos = {name: probe(path) for name, path in given}
+
+    print("Lining the chorus clips up by their audio…")
+    synced = circles.sync([circles.read_audio(path) if infos[name].has_audio else None for name, path in given],
+                          [name for name, _ in given])
+    for note in synced.notes:
+        print(f"warning: {note}", file=sys.stderr)
+
+    est = PoseEstimator(args.model, args.device)
+    at = _seconds(args.at)
+    placed = []
+    for (name, path), offset, conf in zip(given, synced.offsets, synced.confidence):
+        slot, info = slots[name], infos[name]
+        framing = circles.find_framing(path, slot.diameter, est, desc=f"Finding the face ({name})")
+        if framing.note:
+            print(f"warning: {name}: {framing.note}", file=sys.stderr)
+        text = circles.build_setting(slot, canvas, (info.width, info.height), framing)
+        out = Path(path).with_suffix(f".{name}.circle.setting")
+        out.write_text(text)
+        sure = "" if conf == float("inf") else f" (sync {conf:.1f}x surer than the next best)"
+        print(f"{name}: {Path(path).name} starts {offset:.3f}s after the earliest clip{sure}; "
+              f"zoom {framing.zoom * 100:.0f}%. Wrote {out.name}")
+        placed.append(resolve_api.Circle(str(Path(path).resolve()), slot, info.frame_count,
+                                         round((at + offset) * float(main_info.fps)), text, str(out),
+                                         info.has_audio))
+    if args.no_resolve:
+        print("Not building in Resolve (--no-resolve). By hand: put each clip on its own track above the main "
+              "video at the offsets above, open it in the Fusion page, drag its .circle.setting into the Node "
+              "Editor, connect MediaIn1 to CircleFace if it isn't, and CirclePlace to MediaOut1.")
+        return
+
+    job = resolve_api.Job(str(Path(args.main).resolve()), main_info.frame_count, main_info.fps, canvas, placed,
+                          f"{Path(args.main).stem} circles")
+    try:
+        resolve, module = resolve_api.connect()
+        name = resolve_api.build(resolve, job, module.readstring)
+    except resolve_api.ResolveError as e:
+        sys.exit(f"error: {e}\nThe .circle.setting files are written, so this can also be done by hand "
+                 "(see --no-resolve).")
+    for w in job.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    print(f"Built the timeline \"{name}\" in Resolve. The circles are linked: drag them together to where the "
+          "chorus comes in. To resize one, change Zoom in the Inspector (it scales around the circle), or "
+          "CircleZoom's Size in the Fusion page to zoom on the face.")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="headlock",
                                      description="Head-lock stabilization for DaVinci Resolve and Premiere Pro")
@@ -274,6 +342,23 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--fps", default="30000/1001")
     p.add_argument("--seconds", type=float, default=10.0)
     p.set_defaults(func=cmd_test_clip)
+
+    p = sub.add_parser("circles", help="Chorus clips in three soft circles along the bottom, built in Resolve")
+    p.add_argument("main", help="The main (vertical) video; sets the timeline's size and frame rate")
+    p.add_argument("--left", help="Chorus clip for the left circle")
+    p.add_argument("--middle", help="Chorus clip for the middle circle")
+    p.add_argument("--right", help="Chorus clip for the right circle")
+    p.add_argument("--at", default="0",
+                   help="Where the chorus clips start on the timeline, e.g. 1:23.4 (default 0; drag them after)")
+    p.add_argument("--diameter", type=float, default=0.30, help="Circle size, fraction of the width (default 0.30)")
+    p.add_argument("--y", type=float, default=0.85,
+                   help="Height of the circles' centres, fraction from the top (default 0.85)")
+    p.add_argument("--soft", type=float, default=0.04, help="Soft edge, fraction of the circle size (default 0.04)")
+    p.add_argument("--no-resolve", action="store_true",
+                   help="Only write the .circle.setting files and print the sync; don't build in Resolve")
+    p.add_argument("--model", default="rtmpose-halpe26-384", choices=["rtmpose-halpe26-384", "rtmpose-halpe26-256"])
+    p.add_argument("--device", default="cpu", choices=["cpu", "coreml", "cuda"])
+    p.set_defaults(func=cmd_circles)
 
     args = parser.parse_args(argv)
     args.func(args)

@@ -9,6 +9,10 @@ smooths it lightly with a zero-phase filter, and then:
   camera inside the sphere to keep the head on the lock point and renders the flat, head-locked
   video (9:16 by default). A 360 frame has no edges, so nothing is ever cropped past the picture.
 
+It also builds **chorus circles** in DaVinci Resolve: three extra clips of you singing the chorus,
+each in a soft-edged circle along the bottom of the main vertical video, lined up with each other
+by their audio.
+
 ## Setup
 
 ```sh
@@ -19,11 +23,19 @@ run and are cached.
 
 ## The app
 
-Double-click **`Headlock.command`** in Finder (or run `uv run headlock-ui`). Choose a video; the app
-spots 360 footage (2:1 frames) and portrait clips and sets sensible defaults. Press **Track & export**.
-Once a video has been tracked, **Re-export** reuses the tracking, so changing the framing only takes
-the export/render time. **Show in Finder** reveals the result. Everything below can also be done from
-the command line; the app runs the same code.
+Double-click **`Headlock.command`** in Finder (or run `uv run headlock-ui`). It has three tabs:
+
+- **Head-lock**: choose a video; the app spots 360 footage (2:1 frames) and portrait clips and sets
+  sensible defaults. Press **Track & export**. Once a video has been tracked, **Re-export** reuses the
+  tracking, so changing the framing only takes the export/render time.
+- **Chorus circles**: choose the main video and the left, middle and right chorus clips, then
+  **Build in Resolve** (see below). **Add Headlock to Resolve's Scripts menu** puts a *Headlock* item
+  under Workspace > Scripts in Resolve that opens this window.
+- **Check & test**: the fit check for a tracked clip, and the synthetic test clips used to validate
+  the Resolve/Premiere output.
+
+**Show in Finder** reveals the result. Everything below can also be done from the command line; the
+app runs the same code.
 
 ## Flat video → DaVinci Resolve
 
@@ -78,6 +90,39 @@ survives for grading in Resolve. To do the crop in Resolve instead, render large
 `--output-resolution 2160x3840 --fov 120`), put that on a 1080x1920 timeline and set a fixed
 zoom/position: the head is already locked, so any fixed crop stays locked. Track a small export and
 render from the full-resolution one with `--source`. Spatial (4-channel) audio is passed through as is.
+
+## Chorus circles (DaVinci Resolve)
+
+The main vertical video on V1, and three clips of you singing the chorus in equal circles along the
+bottom (centred at 1/6, 1/2 and 5/6 of the width), each with a slightly soft edge.
+
+```sh
+uv run headlock circles song.mp4 --left chorus1.mov --middle chorus2.mov --right chorus3.mov --device coreml
+```
+It:
+1. lines the three chorus clips up **with each other** by their audio (where the notes and words
+   start, so different harmony parts still line up). It doesn't try to match them to the main video,
+   which sings different parts. A warning means the match was uncertain: check it by ear;
+2. finds each singer's head with the pose model (on 40 frames across the clip) and frames the circle
+   on it, with the head filling about half the circle;
+3. writes `chorus1.left.circle.setting` (and so on) next to each clip;
+4. builds a new timeline in the open Resolve project, `song circles`: the main video on V1/A1 and
+   the chorus clips on V2-V4, their audio on A2-A4 so you can mix the extra voices in. The six chorus
+   items are **linked**: drag them together to where the chorus comes in (or give `--at 1:23.4`).
+
+Each circle is made in the clip's Fusion comp (`CircleFace` → `CircleZoom` → `CirclePlace` →
+`MediaOut1`), so the clip comes out as the full frame, transparent outside its circle. To adjust:
+- **Zoom on the face**: Fusion page, `CircleZoom` → Size. It zooms around the face, which stays centred.
+- **Make a whole circle bigger or smaller**: Edit page, Inspector → Zoom. The clip's Anchor Point is
+  set to the circle's centre, so it grows in place.
+- Circle size, height and softness for all three: `--diameter 0.30` (fraction of the width; 0.33
+  touches), `--y 0.85` (centre height from the top), `--soft 0.04` (fraction of the circle size).
+
+Resolve setup (once): it must be **DaVinci Resolve Studio** (the free version can't be driven from
+outside), with Preferences → System → General → **External scripting using: Local**, and a project
+open. `--no-resolve` skips Resolve and only writes the `.circle.setting` files and prints the sync;
+by hand, put each clip on its own track, open it in the Fusion page, drag its `.circle.setting` into
+the Node Editor, connect `MediaIn1` to `CircleFace` if it isn't already, and `CirclePlace` to `MediaOut1`.
 
 ## Framing options (`track` and `export`)
 | Flag | Default | Meaning |

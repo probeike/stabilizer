@@ -38,7 +38,7 @@ def probe(path: str | Path) -> VideoInfo:
         [
             "ffprobe", "-v", "error",
             "-show_entries", "stream=codec_type,width,height,r_frame_rate,avg_frame_rate,nb_frames,duration"
-            ":format=duration",
+            ":stream_tags=rotate:stream_side_data=rotation:format=duration",
             "-of", "json", str(path),
         ],
         check=True, capture_output=True, text=True,
@@ -52,13 +52,22 @@ def probe(path: str | Path) -> VideoInfo:
     else:
         duration = float(stream.get("duration") or data["format"]["duration"])
         frame_count = round(duration * fps)
-    return VideoInfo(path, int(stream["width"]), int(stream["height"]), fps, frame_count, has_audio)
+    width, height = int(stream["width"]), int(stream["height"])
+    # Phones store portrait video sideways with a rotation flag; ffmpeg decodes it upright, so report
+    # the upright size.
+    rotation = next((float(d["rotation"]) for d in stream.get("side_data_list", []) if "rotation" in d),
+                    float(stream.get("tags", {}).get("rotate", 0)))
+    if round(rotation) % 180 == 90:
+        width, height = height, width
+    return VideoInfo(path, width, height, fps, frame_count, has_audio)
 
 
-def iter_frames(path: str | Path, max_height: int | None = 1080, depth: int = 8) -> Iterator[np.ndarray]:
+def iter_frames(path: str | Path, max_height: int | None = 1080, depth: int = 8,
+                step: int = 1) -> Iterator[np.ndarray]:
     """Yield BGR frames, downscaled so height <= max_height (aspect preserved).
 
     depth 8 -> uint8 frames; depth 16 -> uint16, which keeps 10-bit (e.g. log) sources intact.
+    step > 1 yields only every step-th frame (0, step, 2*step, ...), dropped before scaling.
     """
     info = probe(path)
     w, h = info.width, info.height
@@ -66,8 +75,13 @@ def iter_frames(path: str | Path, max_height: int | None = 1080, depth: int = 8)
         w = round(w * max_height / h / 2) * 2
         h = max_height
     cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0"]
+    filters = [f"select=not(mod(n\\,{step}))"] if step > 1 else []
     if (w, h) != (info.width, info.height):
-        cmd += ["-vf", f"scale={w}:{h}:flags=area"]
+        filters.append(f"scale={w}:{h}:flags=area")
+    if filters:
+        cmd += ["-vf", ",".join(filters)]
+    if step > 1:
+        cmd += ["-fps_mode", "passthrough"]
     dtype, pix_fmt = (np.dtype("<u2"), "bgr48le") if depth == 16 else (np.dtype(np.uint8), "bgr24")
     cmd += ["-f", "rawvideo", "-pix_fmt", pix_fmt, "-"]
     frame_bytes = w * h * 3 * dtype.itemsize

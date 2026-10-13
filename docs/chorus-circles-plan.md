@@ -1,7 +1,31 @@
 # Plan: chorus circles + one app for everything
 
-Status: researched and designed; **no feature code written yet**. Paused on 2026-10-12 to move
-machines. See `target-machine.md` for the machine this must finally run on.
+Status: **implemented on 2026-10-13** (`circles.py`, `resolve_api.py`, `headlock circles`, the tabbed
+app), tested against a fake Resolve API; **not yet run inside Resolve**. Do the "Verify in Resolve"
+list below on the target machine (`target-machine.md`) before relying on it.
+
+## What was built, and where it differs from the design below
+- `.circle.setting` files are named per slot: `<clip>.<left|middle|right>.circle.setting`.
+- The square the circle is cut from is a little bigger than the circle (`D = d·(1 + 2·soft)`, even),
+  so the soft edge has room; the mask's Width/Height = d/D, SoftEdge = soft·d/D. The visible
+  (half-transparent) edge is at the requested diameter.
+- Sync: the onset envelope keeps only its peaks and widens each to 70 ms (a max filter) before the
+  cross-correlation. Separate takes never start words at exactly the same moment; plain spiky
+  envelopes lost the match with ±40 ms of slop, blurring flattened the true peak below chance
+  matches, and widening holds it to under a frame with ±60 ms slop (see `tests/test_circles.py`).
+  Zero-padding the audio was also dropped: silence before the first sample reads as an onset at
+  every take's start and they lined up with each other at lag 0.
+- Framing never zooms out so far that the circle would show past the picture's edge.
+- The Resolve build uses `Timeline.SetSetting` / `TimelineItem.SetProperty` one key at a time. It
+  tries `endFrame` = clip length and then length - 1 (inclusive or exclusive isn't documented),
+  reuses media already in the pool, gives the timeline a unique name, explicitly connects
+  `CircleFace` to `MediaIn1` and `CirclePlace` to `MediaOut1` after pasting, and reads back
+  `CircleMask`'s `MaskWidth`/`MaskHeight` to warn if those input IDs are wrong.
+- The Scripts-menu item and "Add Headlock to Resolve's Scripts menu" button are in the Chorus
+  circles tab; Check & test holds the fit check and test clips.
+- `video.probe` now reports the upright size of phone clips stored sideways with a rotation flag
+  (ffmpeg decodes them upright). Before, a portrait iPhone clip read as landscape, which would have
+  made a landscape timeline and garbled the decoded frames (this affected `track` too).
 
 ## What the user wants
 1. **Chorus circles.** A vertical video of them singing (the *main* video, on V1). Three more clips of
@@ -122,6 +146,10 @@ full `.comp` file). Other `TimelineItemProperties`: `Pan`, `Tilt`, `ZoomX`, `Zoo
    clip?
 7. Run the existing `headlock test-clip dot.mp4` check from the README too (the Resolve mapping hasn't
    been confirmed in the app yet).
+8. With a portrait phone clip (stored sideways + rotation flag): does Resolve show it upright, and
+   does MediaIn1 deliver it upright at the upright size? The framing assumes so.
+9. Does `import DaVinciResolveScript` load `fusionscript.so` in our Python 3.12 venv (Resolve bundles
+   3.14)? If not, the app can't build the timeline; the `.circle.setting` files still work by hand.
 
 ### Tests to write
 - slot geometry (centres at 1/6, 1/2, 5/6; diameter; even D);
