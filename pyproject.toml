@@ -1,7 +1,7 @@
 [project]
 name = "headlock"
 version = "0.1.0"
-description = "Head-lock stabilization: track a dancer's head and export Premiere Pro (FCP7 XML) motion keyframes"
+description = "Head-lock stabilization: track a head and export DaVinci Resolve / Premiere Pro keyframes, or reframe 360 video"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -10,13 +10,17 @@ dependencies = [
     "opencv-python",
     "onnxruntime",
     "rtmlib",
+    "tqdm",
 ]
+
+[project.gui-scripts]
+headlock-ui = "headlock.ui:main"
 
 [project.scripts]
 headlock = "headlock.cli:main"
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "lupa"]
 
 [build-system]
 requires = ["hatchling"]

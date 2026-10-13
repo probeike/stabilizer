@@ -55,8 +55,11 @@ def probe(path: str | Path) -> VideoInfo:
     return VideoInfo(path, int(stream["width"]), int(stream["height"]), fps, frame_count, has_audio)
 
 
-def iter_frames(path: str | Path, max_height: int | None = 1080) -> Iterator[np.ndarray]:
-    """Yield BGR uint8 frames, downscaled so height <= max_height (aspect preserved)."""
+def iter_frames(path: str | Path, max_height: int | None = 1080, depth: int = 8) -> Iterator[np.ndarray]:
+    """Yield BGR frames, downscaled so height <= max_height (aspect preserved).
+
+    depth 8 -> uint8 frames; depth 16 -> uint16, which keeps 10-bit (e.g. log) sources intact.
+    """
     info = probe(path)
     w, h = info.width, info.height
     if max_height and h > max_height:
@@ -65,35 +68,51 @@ def iter_frames(path: str | Path, max_height: int | None = 1080) -> Iterator[np.
     cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0"]
     if (w, h) != (info.width, info.height):
         cmd += ["-vf", f"scale={w}:{h}:flags=area"]
-    cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-    frame_bytes = w * h * 3
+    dtype, pix_fmt = (np.dtype("<u2"), "bgr48le") if depth == 16 else (np.dtype(np.uint8), "bgr24")
+    cmd += ["-f", "rawvideo", "-pix_fmt", pix_fmt, "-"]
+    frame_bytes = w * h * 3 * dtype.itemsize
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     try:
         while True:
             buf = proc.stdout.read(frame_bytes)
             if len(buf) < frame_bytes:
                 break
-            yield np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            yield np.frombuffer(buf, dtype).reshape(h, w, 3)
     finally:
         proc.stdout.close()
         proc.kill()
         proc.wait()
 
 
-class VideoWriter:
-    """Pipe BGR frames into an ffmpeg H.264 encode."""
+def wants_16bit(path: str | Path) -> bool:
+    """.mov outputs are ProRes 422 HQ (10-bit), worth feeding 16-bit frames."""
+    return Path(path).suffix.lower() == ".mov"
 
-    def __init__(self, path: str | Path, width: int, height: int, fps: Fraction):
-        self.proc = subprocess.Popen(
-            [
-                "ffmpeg", "-v", "error", "-y",
-                "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
-                "-r", f"{fps.numerator}/{fps.denominator}", "-i", "-",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
-                str(path),
-            ],
-            stdin=subprocess.PIPE,
-        )
+
+class VideoWriter:
+    """Pipe BGR frames into an ffmpeg encode: ProRes 422 HQ for .mov, otherwise H.264.
+
+    ``audio_from`` copies that file's audio (re-encoded: PCM in .mov, AAC otherwise).
+    ``depth`` 16 takes uint16 frames, as ``iter_frames(depth=16)`` yields.
+    """
+
+    def __init__(self, path: str | Path, width: int, height: int, fps: Fraction,
+                 audio_from: str | Path | None = None, depth: int = 8, crf: int = 20):
+        cmd = [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgr48le" if depth == 16 else "bgr24", "-s", f"{width}x{height}",
+            "-r", f"{fps.numerator}/{fps.denominator}", "-i", "-",
+        ]
+        if audio_from:
+            cmd += ["-i", str(audio_from), "-map", "0:v", "-map", "1:a:0?"]
+        if wants_16bit(path):
+            cmd += ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"]
+            cmd += ["-c:a", "pcm_s16le"] if audio_from else []
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", str(crf), "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart"]
+            cmd += ["-c:a", "aac", "-b:a", "256k"] if audio_from else []
+        self.proc = subprocess.Popen(cmd + [str(path)], stdin=subprocess.PIPE)
 
     def write(self, frame: np.ndarray) -> None:
         self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())

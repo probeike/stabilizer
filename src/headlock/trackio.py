@@ -1,4 +1,8 @@
-"""track.json: raw per-frame head positions, normalized to the tracked frame (0-1, origin top-left)."""
+"""track.json: raw per-frame head positions, normalized to the tracked frame (0-1, origin top-left).
+
+For 360 sources (projection "equirect") the frame is the equirect image, so (u, v) is longitude
+and latitude: see ``sphere.uv_to_dirs``.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ class Track:
     conf: np.ndarray           # (N,)
     fraction: float = 2 / 3
     has_audio: bool = False
+    projection: str = "flat"   # "flat" or "equirect" (360)
 
     def head_px(self, size: tuple[int, int] | None = None) -> np.ndarray:
         return self.head * np.array(size or self.source_size, dtype=float)
@@ -33,6 +38,7 @@ class Track:
             "fps": f"{self.fps.numerator}/{self.fps.denominator}",
             "fraction": self.fraction,
             "has_audio": self.has_audio,
+            "projection": self.projection,
             "head": [None if np.isnan(p).any() else [round(float(p[0]), 6), round(float(p[1]), 6)]
                      for p in self.head],
             "conf": [round(float(c), 4) for c in self.conf],
@@ -52,4 +58,5 @@ class Track:
             conf=np.array(data["conf"], dtype=float),
             fraction=data.get("fraction", 2 / 3),
             has_audio=data.get("has_audio", False),
+            projection=data.get("projection", "flat"),
         )
